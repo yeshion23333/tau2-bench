@@ -30,6 +30,9 @@ from tau2.environment.environment import Environment, EnvironmentInfo
 from tau2.orchestrator.modes import CommunicationMode
 from tau2.user.user_simulator import DummyUser, UserSimulator, UserState
 from tau2.user.user_simulator_base import (
+    OUT_OF_SCOPE,
+    STOP,
+    TRANSFER,
     HalfDuplexUser,
     UserError,
     is_valid_user_history_message,
@@ -405,6 +408,7 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
         simulation_id: Optional[str] = None,
         validate_communication: bool = False,
         timeout: Optional[float] = None,
+        defer_user_stop: bool = False,
     ):
         """
         Initialize the Orchestrator for managing simulation between Agent, User, and Environment.
@@ -428,6 +432,8 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
             validate_communication: If True, validates communication protocol rules (e.g., no mixed
                                    messages with both text and tool calls). Defaults to False.
             timeout: Maximum wallclock time in seconds. None means no timeout.
+            defer_user_stop: Close only the user dialogue on STOP, allowing the
+                             external agent to finish already-authorized tool calls.
         """
         # Initialize base class
         super().__init__(
@@ -448,6 +454,8 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
         self.trajectory: list[Message] = []
         self.solo_mode = solo_mode
         self.validate_communication = validate_communication
+        self.defer_user_stop = defer_user_stop
+        self.user_dialogue_closed = False
 
         # Turn-based routing state
         self.from_role: Optional[Role] = None
@@ -579,7 +587,7 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
                     ]
                 )
                 self.message = last_message
-                self.done = UserSimulator.is_stop(last_message)
+                self.done = self._user_stops_simulation(last_message)
                 if self.done:
                     self.termination_reason = TerminationReason.USER_STOP
             # Last message is a tool message
@@ -731,6 +739,19 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
                     f"{self.from_role.value} can only send tool calls. {self.message}"
                 )
 
+    def _user_stops_simulation(self, message: UserMessage) -> bool:
+        if not UserSimulator.is_stop(message):
+            return False
+        content = message.content or ""
+        if (
+            self.defer_user_stop
+            and STOP in content
+            and not any(token in content for token in (TRANSFER, OUT_OF_SCOPE))
+        ):
+            self.user_dialogue_closed = True
+            return False
+        return True
+
     def _check_termination(self) -> None:
         """
         Check for half-duplex specific termination conditions.
@@ -842,7 +863,7 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
                 self.message, self.user_state
             )
             user_msg.validate()
-            if UserSimulator.is_stop(user_msg):
+            if self._user_stops_simulation(user_msg):
                 self.done = True
                 self.termination_reason = TerminationReason.USER_STOP
             # Update voice metadata if audio was generated
@@ -862,6 +883,9 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
             agent_msg, self.agent_state = self.agent.generate_next_message(
                 self.message, self.agent_state
             )
+            # External Gym close wakes a waiting agent without adding a fake action.
+            if self.done:
+                return
             agent_msg.validate()
             if self.agent.is_stop(agent_msg):
                 self.done = True

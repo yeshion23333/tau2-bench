@@ -11,6 +11,8 @@ Your goal is to simulate realistic customer interactions while following specifi
 
 ## Task Completion
 - The goal is to continue the conversation until the task is complete.
+- If the agent asks you to confirm or authorize a backend action, reply with the requested confirmation but do not emit `###STOP###` in the same turn.
+- For backend actions, wait until the agent explicitly reports that all requested actions are complete before emitting `###STOP###`. A plan or your confirmation is not completion.
 - If the instruction goal is satisified, generate the '###STOP###' token to end the conversation.
 - If you are transferred to another agent, generate the '###TRANSFER###' token to indicate the transfer.
 - If you find yourself in a situation in which the scenario does not provide enough information for you to continue the conversation, generate the '###OUT-OF-SCOPE###' token to end the conversation.

@@ -1,6 +1,10 @@
+from unittest.mock import Mock
+
 import pytest
 
+from tau2.data_model.message import UserMessage
 from tau2.gym.gym_agent import AgentGymEnv, GymAgent, TauSpace
+from tau2.user.user_simulator import UserSimulator
 
 from .utils import timeout
 
@@ -140,29 +144,79 @@ class TestTauGymEnv:
                 if line.strip():  # Skip empty lines
                     assert ":" in line, f"Line '{line}' should contain ':'"
 
-    @timeout(30)
-    def test_tau_gym_env_termination(self):
-        """Test that TauGymEnv properly handles simulation termination."""
-        env = AgentGymEnv(domain="mock", task_id="create_task_1")
+    @pytest.mark.parametrize("defer_user_stop", [False, True])
+    @pytest.mark.parametrize(
+        "token", ["###STOP###", "###TRANSFER###", "###OUT-OF-SCOPE###"]
+    )
+    @pytest.mark.parametrize("ending", ["done", "max_steps", "agent_error"])
+    def test_tau_gym_env_termination(self, monkeypatch, defer_user_stop, token, ending):
+        """User STOP may close dialogue while business tools finish before cleanup."""
+        replies = iter(
+            [
+                "Create Important Meeting for user_1.",
+                f"Yes, please proceed. {token}",
+            ]
+        )
+        user_generate = Mock(
+            side_effect=lambda message, state: (
+                UserMessage(role="user", content=next(replies)),
+                state,
+            )
+        )
+        monkeypatch.setattr(UserSimulator, "generate_next_message", user_generate)
+        monkeypatch.setattr(AgentGymEnv, "_get_reward", lambda self: (0.0, "{}"))
+        env = AgentGymEnv(
+            domain="mock", task_id="create_task_1", defer_user_stop=defer_user_stop
+        )
+        try:
+            env.reset()
+            observation, _, terminated, _, _ = env.step("May I create that task?")
+            assert token in observation
+            assert user_generate.call_count == 2
+            if not defer_user_stop or token != "###STOP###":
+                assert terminated
+                assert env._simulation_run.termination_reason == "user_stop"
+                return
 
-        # Reset the environment
-        observation, info = env.reset()
-
-        # Take steps until termination or max steps
-        max_steps = 10
-        step_count = 0
-
-        while step_count < max_steps:
-            action = f"Step {step_count}: I'm helping you."
-            observation, reward, terminated, truncated, info = env.step(action)
-
-            if terminated:
-                break
-
-            step_count += 1
-
-        # Check that we either terminated or reached max steps
-        assert step_count <= max_steps
+            assert not terminated
+            assert env._orchestrator.user_dialogue_closed
+            assert env._simulation_run is None
+            observation, _, terminated, _, _ = env.step("Please confirm again.")
+            assert observation.startswith("Error: User dialogue is closed.")
+            assert not terminated
+            assert user_generate.call_count == 2
+            observation, _, terminated, _, _ = env.step(
+                '{"name":"create_task","arguments":{"user_id":"user_1","title":"Important Meeting"}}'
+            )
+            assert "Important Meeting" in observation
+            assert not terminated
+            assert any(
+                task.title == "Important Meeting"
+                for task in env._orchestrator.environment.tools.db.tasks.values()
+            )
+            if ending == "done":
+                _, _, terminated, _, _ = env.step('{"name":"done","arguments":{}}')
+                assert terminated
+                expected_reason = "agent_stop"
+            else:
+                env.close(termination_reason=ending)
+                expected_reason = ending
+            assert env._simulation_run.termination_reason == expected_reason
+            assert (
+                len([m for m in env._simulation_run.messages if m.role == "user"]) == 2
+            )
+            assert any(
+                call.name == "create_task"
+                for message in env._simulation_run.messages
+                for call in (getattr(message, "tool_calls", None) or [])
+            )
+            if ending != "done":
+                assert not any(
+                    m.content == "###STOP###" for m in env._simulation_run.messages
+                )
+        finally:
+            env.close()
+        assert not env._orchestrator_thread.is_alive()
 
     @timeout(15)
     def test_tau_gym_env_thread_safety(self):

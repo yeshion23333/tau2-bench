@@ -23,7 +23,7 @@ from tau2.data_model.message import (
     MultiToolMessage,
     UserMessage,
 )
-from tau2.data_model.simulation import SimulationRun
+from tau2.data_model.simulation import SimulationRun, TerminationReason
 from tau2.data_model.tasks import Task
 from tau2.environment.environment import Environment
 from tau2.environment.tool import Tool, as_tool
@@ -47,6 +47,11 @@ TAU_BENCH_ENV_ID = f"{TAU_BENCH_ENV_NAME}-{TAU_BENCH_ENV_VERSION}"
 TAU_BENCH_USER_ENV_NAME = "tau-bench-user"
 TAU_BENCH_USER_ENV_VERSION = "v0"
 TAU_BENCH_USER_ENV_ID = f"{TAU_BENCH_USER_ENV_NAME}-{TAU_BENCH_USER_ENV_VERSION}"
+
+USER_DIALOGUE_CLOSED = (
+    "Error: User dialogue is closed. No further customer replies or confirmations "
+    "are available. Only complete actions already authorized by the user, then call done."
+)
 
 
 class TauSpace(gym.spaces.Space):
@@ -593,6 +598,7 @@ class AgentGymEnv(gym.Env):
         user_llm: Optional[str] = None,
         user_llm_args: Optional[dict] = None,
         all_messages_as_observation: bool = False,
+        defer_user_stop: bool = False,
     ):
         """
         Initialize the Tau2 gym environment.
@@ -610,6 +616,7 @@ class AgentGymEnv(gym.Env):
             user_llm_args if user_llm_args else deepcopy(DEFAULT_LLM_ARGS_USER)
         )
         self.all_messages_as_observation = all_messages_as_observation
+        self.defer_user_stop = defer_user_stop
 
         self._lock = threading.Lock()
         self._agent: Optional[GymAgent] = None
@@ -673,21 +680,12 @@ class AgentGymEnv(gym.Env):
             (e.g., due to an error), an empty observation is returned.
         """
         super().reset(seed=seed)
+        self.close()
 
         with self._lock:
             # Reset state
             self._simulation_run = None
             self._simulation_done.clear()
-
-            # Wait for any existing thread to finish
-            if self._orchestrator_thread and self._orchestrator_thread.is_alive():
-                self._orchestrator_thread.join(timeout=1.0)
-                if self._orchestrator_thread.is_alive():
-                    self._log(
-                        "Previous orchestrator thread did not terminate within timeout. "
-                        "Continuing anyway (daemon thread will be cleaned up).",
-                        "WARNING",
-                    )
 
             # Create new orchestrator
             self._orchestrator = self._get_orchestrator()
@@ -804,6 +802,13 @@ class AgentGymEnv(gym.Env):
                     self._get_info(),
                 )
 
+            if (
+                self._orchestrator.user_dialogue_closed
+                and not action_msg.is_tool_call()
+                and not self._agent.is_stop(action_msg)
+            ):
+                return USER_DIALOGUE_CLOSED, 0.0, False, False, self._get_info()
+
             # Provide the action to the agent
             self._agent.set_action(action_msg)
 
@@ -828,6 +833,24 @@ class AgentGymEnv(gym.Env):
                 False,
                 info,
             )
+
+    def close(
+        self, *, termination_reason: TerminationReason = TerminationReason.AGENT_STOP
+    ) -> None:
+        """Finalize a live simulation when the external agent loop exits."""
+        with self._lock:
+            thread = self._orchestrator_thread
+            if thread is None:
+                return
+            if thread.is_alive() and not self._simulation_done.is_set():
+                self._orchestrator.done = True
+                self._orchestrator.termination_reason = TerminationReason(
+                    termination_reason
+                )
+                self._agent.set_action(AssistantMessage(role="assistant", content=STOP))
+            thread.join(timeout=5.0)
+            if thread.is_alive():
+                raise RuntimeError("Orchestrator did not terminate after close().")
 
     def _get_reward(self) -> tuple[float, str]:
         """
@@ -1085,6 +1108,7 @@ class AgentGymEnv(gym.Env):
             task=self._get_task(),
             max_steps=self.max_steps,
             solo_mode=self.solo_mode,
+            defer_user_stop=self.defer_user_stop,
         )
 
 
